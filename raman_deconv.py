@@ -167,16 +167,19 @@ def save_curve_image(x, y, result, filename, peak_dict, settings_dict, curve_ima
         else:
             label = comp_name
         ax_main.plot(x_fit, y_fit_components[prefixname], '-', label=label)
+        """
+        # Need to add peak center vertical line to the plot
+        """
 
     ax_main.set_xlabel('x')
     ax_main.set_ylabel('y')
     mae = np.mean(np.abs(residuals))
     ax_res.set_title(f'Residuals (MAE={mae:.4g})')
     ax_main.set_title('Spectrum and fit')
-    fig.suptitle(filename, fontsize=18, fontweight='bold')
+    fig.suptitle(filename, fontsize=18, fontweight='bold', y=0.975)
 
     ax_main.legend()
-    plt.tight_layout(rect=[0, 0.03, 1, 0.93])
+    plt.tight_layout(rect=[0, 0.03, 1, 0.98])
     fig.savefig(os.path.join(curve_image_path, filename + '.png'), bbox_inches='tight', dpi=300)
 
 if __name__ == "__main__":
