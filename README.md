@@ -8,6 +8,7 @@
 ```
 lmfit
 matplotlib
+tqdm
 
 (이하 패키지들은 위 패키지 설치 시 자동 설치됨)
 scipy
