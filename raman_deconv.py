@@ -63,7 +63,8 @@ def construct_model(peak_dict, settings_dict):
     params = model.make_params()
     for peak_name in peak_names:
         params[peak_name+'_amplitude'].set(min=0)
-        params[peak_name+'_center'].set(min=peak_dict[peak_name][0], max=peak_dict[peak_name][1])
+        params[peak_name+'_center'].set((peak_dict[peak_name][0] + peak_dict[peak_name][1])/2, min=peak_dict[peak_name][0], max=peak_dict[peak_name][1])
+        params[peak_name+'_sigma'].set(min=settings_dict['SIGMA_LB'], max=settings_dict['SIGMA_UB'])
     
     return model, params
 
@@ -130,7 +131,7 @@ def save_curve_image(x, y, result, filename, peak_dict, settings_dict, curve_ima
     
     fig, (ax_res, ax_main) = plt.subplots(
         2, 1,
-        figsize=(11,19),
+        figsize=(10, 10),
         sharex=True,
         gridspec_kw={'height_ratios': [1, 3]}
     )
@@ -141,19 +142,42 @@ def save_curve_image(x, y, result, filename, peak_dict, settings_dict, curve_ima
     ax_res.set_ylabel('residuals')
 
     # Plot main figure
+    ax_main.scatter(x, y, label='measured data')
+    
     x_fit = np.linspace(settings_dict['RANGE_MIN'], settings_dict['RANGE_MAX'], FNC_DOTS)
     y_fit = result.model.eval(params=result.params, x=x_fit)
-    ax_main.plot(x_fit, y_fit, '-', label='fit', color='gray')
+    fit_label = f"fit (R²={result.rsquared:.4f})"
+    ax_main.plot(x_fit, y_fit, '-', label=fit_label, color='#a0a0a0')
+
+    peak_names = list(peak_dict.keys())
+    peak_amplitudes = [result.best_values[peak_name + '_amplitude'] for peak_name in peak_names]
+    total_amplitude = sum(peak_amplitudes)
+    peak_ratios = {}
+    if total_amplitude != 0:
+        for name, amp in zip(peak_names, peak_amplitudes):
+            peak_ratios[name] = amp / total_amplitude * 100
+
+    # component curves (peak + background)
     y_fit_components = result.model.eval_components(params=result.params, x=x_fit)
     for i in range(len(y_fit_components)):
         prefixname = result.model.components[i].prefix
-        ax_main.plot(x_fit, y_fit_components[prefixname], '-', label=prefixname[:-1])
+        comp_name = prefixname[:-1]
+        if comp_name in peak_ratios:
+            label = f"{comp_name} ({peak_ratios[comp_name]:.1f}%)"
+        else:
+            label = comp_name
+        ax_main.plot(x_fit, y_fit_components[prefixname], '-', label=label)
 
     ax_main.set_xlabel('x')
     ax_main.set_ylabel('y')
+    mae = np.mean(np.abs(residuals))
+    ax_res.set_title(f'Residuals (MAE={mae:.4g})')
+    ax_main.set_title('Spectrum and fit')
+    fig.suptitle(filename, fontsize=18, fontweight='bold')
+
     ax_main.legend()
-    fig.savefig(os.path.join(curve_image_path, filename[:-4] + '.png'))
-    fig.close()
+    plt.tight_layout(rect=[0, 0.03, 1, 0.93])
+    fig.savefig(os.path.join(curve_image_path, filename + '.png'), bbox_inches='tight', dpi=300)
 
 if __name__ == "__main__":
     file_names = os.listdir(DATA_PATH)
