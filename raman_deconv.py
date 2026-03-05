@@ -164,12 +164,12 @@ def save_curve_image(x, y, result, filename, peak_dict, settings_dict, curve_ima
         comp_name = prefixname[:-1]
         if comp_name in peak_ratios:
             label = f"{comp_name} ({peak_ratios[comp_name]:.1f}%)"
+            # peak center vertical line
+            center = result.best_values[comp_name + '_center']
+            ax_main.axvline(center, color='gray', linestyle='--', alpha=0.6)
         else:
             label = comp_name
         ax_main.plot(x_fit, y_fit_components[prefixname], '-', label=label)
-        """
-        # Need to add peak center vertical line to the plot
-        """
 
     ax_main.set_xlabel('x')
     ax_main.set_ylabel('y')
