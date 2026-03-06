@@ -4,15 +4,17 @@
 구체적으로는, FSI- 염의 raman spectrum을 free anion, CIP, AGG (AGG1, AGG2,...) 피크로 분해하고, 각 피크의 면적 비교를 하기 위한 코드입니다.
 
 ## 의존성
-본 코드는 python3 기반입니다. 필요한 패키지는 다음과 같습니다.
+본 코드는 python3(>=3.11) 기반입니다. 필요한 패키지는 다음과 같습니다.
 ```
 lmfit
+scikit-learn
 matplotlib
 tqdm
 
 (이하 패키지들은 위 패키지 설치 시 자동 설치됨)
 scipy
 numpy
+...
 ```
 
 ## 사용법

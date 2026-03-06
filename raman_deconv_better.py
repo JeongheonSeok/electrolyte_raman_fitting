@@ -3,8 +3,6 @@ import matplotlib
 matplotlib.use('Agg')  # non-interactive backend; must be set before pyplot import
 import matplotlib.pyplot as plt
 from lmfit import Model, models
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF
 from tqdm import tqdm
 import os
 import csv
@@ -92,34 +90,6 @@ def initialize_params_from_data(params, peak_dict, x, y):
     return params
 
 
-def augment_data_with_gpr(x, y, n_interp):
-    # Normalise x to [0, 1] so RBF length_scale has a consistent scale across datasets.
-    x_min, x_max = x.min(), x.max()
-    x_norm = (x - x_min) / (x_max - x_min)
-
-    # length_scale must be larger than inter-point spacing so the RBF covers multiple
-    # neighbours and produces a smooth curve between data points.
-    # alpha≈0 already guarantees exact passage through the measured points.
-    avg_spacing = 1.0 / max(len(x_norm) - 1, 1)
-    kernel = RBF(length_scale=avg_spacing * 3, length_scale_bounds='fixed')
-    gpr = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=0, normalize_y=True, alpha=1e-10)
-    gpr.fit(x_norm.reshape(-1, 1), y)
-
-    # Insert n_interp equally-spaced points between each pair of adjacent measured points.
-    x_aug_norm = []
-    for i in range(len(x_norm) - 1):
-        seg = np.linspace(x_norm[i], x_norm[i + 1], n_interp + 2)
-        x_aug_norm.extend(seg[:-1].tolist())
-    x_aug_norm.append(float(x_norm[-1]))
-    x_aug_norm = np.array(x_aug_norm)
-
-    y_aug = gpr.predict(x_aug_norm.reshape(-1, 1))
-    y_aug = np.clip(y_aug, 0, None)
-
-    x_aug = x_aug_norm * (x_max - x_min) + x_min
-    return x_aug, y_aug
-
-
 def _run_single_trial(args):
     # Worker for ThreadPoolExecutor; each call runs one local fit
     model, trial_params, x, y = args
@@ -181,48 +151,28 @@ def fit_robust(model, params, x, y, settings_dict):
     return best_result
 
 
-def save_curve_image(
-    x_raw, y_raw, result, filename, peak_dict, settings_dict,
-    curve_image_path=CURVE_IMAGE_PATH,
-    rsquared_raw=None,
-    x_aug=None, y_aug=None,
-    FNC_DOTS=200,
-):
+def save_curve_image(x, y, result, filename, peak_dict, settings_dict, curve_image_path=CURVE_IMAGE_PATH, FNC_DOTS=200):
     if not os.path.exists(curve_image_path):
         os.makedirs(curve_image_path, exist_ok=True)
-
-    # Residuals are always computed against original measured data so the plot
-    # reflects true measurement quality regardless of whether GPR augmentation was used.
-    y_pred_raw = result.model.eval(params=result.params, x=x_raw)
-    residuals_raw = y_raw - y_pred_raw
-
-    r2_display = rsquared_raw if rsquared_raw is not None else result.rsquared
-
+    
     fig, (ax_res, ax_main) = plt.subplots(
         2, 1,
         figsize=(10, 10),
         sharex=True,
         gridspec_kw={'height_ratios': [1, 3]}
     )
-
-    # Residual panel (original data only)
-    ax_res.scatter(x_raw, residuals_raw, s=20, color='steelblue', zorder=3)
-    ax_res.axhline(0, linestyle='--', color='black', linewidth=0.8)
+    # Plot residuals
+    residuals = result.residual
+    ax_res.scatter(x, residuals)
+    ax_res.axhline(0, linestyle='--')
     ax_res.set_ylabel('residuals')
 
-    # Main panel — measured data
-    ax_main.scatter(x_raw, y_raw, label='measured data', color='steelblue', zorder=3)
-
-    # GPR-augmented points (shown only when GPR was applied)
-    if x_aug is not None and y_aug is not None:
-        ax_main.scatter(
-            x_aug, y_aug,
-            label='GPR augmented', color='orange', s=10, alpha=0.6, zorder=2
-        )
-
+    # Plot main figure
+    ax_main.scatter(x, y, label='measured data')
+    
     x_fit = np.linspace(settings_dict['RANGE_MIN'], settings_dict['RANGE_MAX'], FNC_DOTS)
     y_fit = result.model.eval(params=result.params, x=x_fit)
-    fit_label = f"fit (R²={r2_display:.4f})"
+    fit_label = f"fit (R²={result.rsquared:.4f})"
     ax_main.plot(x_fit, y_fit, '-', label=fit_label, color='#a0a0a0')
 
     peak_names = list(peak_dict.keys())
@@ -233,7 +183,7 @@ def save_curve_image(
         for name, amp in zip(peak_names, peak_amplitudes):
             peak_ratios[name] = amp / total_amplitude * 100
 
-    # Component curves (peak + background)
+    # component curves (peak + background)
     y_fit_components = result.model.eval_components(params=result.params, x=x_fit)
     for i in range(len(y_fit_components)):
         prefixname = result.model.components[i].prefix
@@ -248,8 +198,8 @@ def save_curve_image(
 
     ax_main.set_xlabel('x')
     ax_main.set_ylabel('y')
-    mae = np.mean(np.abs(residuals_raw))
-    ax_res.set_title(f'Residuals on measured data (MAE={mae:.4g})')
+    mae = np.mean(np.abs(residuals))
+    ax_res.set_title(f'Residuals (MAE={mae:.4g})')
     ax_main.set_title('Spectrum and fit')
     fig.suptitle(filename, fontsize=18, fontweight='bold', y=0.975)
 
@@ -267,40 +217,18 @@ def process_file(args):
     spectrum = np.loadtxt(file_path, delimiter=',')
     x_all = spectrum[:, 0]; y_all = spectrum[:, 1]
     mask = (x_all >= settings_dict['RANGE_MIN']) & (x_all <= settings_dict['RANGE_MAX'])
-    x_raw = x_all[mask]; y_raw = y_all[mask]
-
-    n_interp = int(settings_dict.get('SPLINE', 0))
-    if n_interp > 0:
-        x_fit, y_fit = augment_data_with_gpr(x_raw, y_raw, n_interp)
-        x_aug, y_aug = x_fit, y_fit
-    else:
-        x_fit, y_fit = x_raw, y_raw
-        x_aug, y_aug = None, None
+    x = x_all[mask]; y = y_all[mask]
 
     model, params = construct_model(peak_dict, settings_dict)
-    params = initialize_params_from_data(params, peak_dict, x_fit, y_fit)
-    result = fit_robust(model, params, x_fit, y_fit, settings_dict)
+    params = initialize_params_from_data(params, peak_dict, x, y)
+    result = fit_robust(model, params, x, y, settings_dict)
 
-    # R² on augmented (or original) data — what the optimizer actually minimised
-    rsquared_aug = result.rsquared
-
-    # R² on original measured data — reflects true measurement quality
-    y_pred_raw = result.model.eval(params=result.params, x=x_raw)
-    ss_res = float(np.sum((y_raw - y_pred_raw) ** 2))
-    ss_tot = float(np.sum((y_raw - np.mean(y_raw)) ** 2))
-    rsquared_raw = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-
-    save_curve_image(
-        x_raw, y_raw, result, filename, peak_dict, settings_dict, curve_image_path,
-        rsquared_raw=rsquared_raw,
-        x_aug=x_aug, y_aug=y_aug,
-    )
+    save_curve_image(x, y, result, filename, peak_dict, settings_dict, curve_image_path)
 
     # Return plain data so the main process can write CSVs without race conditions
     peak_names = list(peak_dict.keys())
     best_values = dict(result.best_values)
-    best_values['rsquared_raw'] = rsquared_raw
-    best_values['rsquared_aug'] = rsquared_aug
+    best_values['rsquared'] = result.rsquared
     return filename, peak_names, best_values
 
 
@@ -317,17 +245,12 @@ def write_csv_results(results, peak_dict):
             writer.writerow([filename] + [a / total * 100 for a in amps])
 
     # Write full fitted parameters
-    _rsq_keys = {'rsquared_raw', 'rsquared_aug'}
-    param_keys = [k for k in results[0][2].keys() if k not in _rsq_keys]
+    param_keys = [k for k in results[0][2].keys() if k != 'rsquared']
     with open(FITTED_FUNCTION_PATH, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['filename'] + param_keys + ['rsquared_raw', 'rsquared_aug'])
+        writer.writerow(['filename'] + param_keys + ['rsquared'])
         for filename, _, best_values in results:
-            writer.writerow(
-                [filename]
-                + [best_values[k] for k in param_keys]
-                + [best_values['rsquared_raw'], best_values['rsquared_aug']]
-            )
+            writer.writerow([filename] + [best_values[k] for k in param_keys] + [best_values['rsquared']])
 
 
 if __name__ == "__main__":
