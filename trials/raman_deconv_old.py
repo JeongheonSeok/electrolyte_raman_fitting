@@ -1,0 +1,209 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from lmfit import Model, models
+#import pandas as pd
+from tqdm import tqdm
+import os
+import csv
+
+DATA_PATH = "./spectra"
+ABSTRACT_RESULT_PATH = "./results/abstract_results.csv"
+FITTED_FUNCTION_PATH = "./results/fitted_functions.csv"
+CURVE_IMAGE_PATH = "./results/curve_images"
+PEAK_LOC_PATH = "./peak_location.csv"
+SETTINGS_PATH = "./settings.csv"
+
+def get_peak_dict(peak_loc_path=PEAK_LOC_PATH):
+    with open(peak_loc_path, 'r') as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        peak_dict = {}
+        for row in reader:
+            peak_dict[row[0]] = [float(row[1]), float(row[2])]
+        if len(peak_dict) == 0:
+            raise ValueError("No peak information found in the file")
+    return peak_dict
+
+def get_settings_dict(settings_path=SETTINGS_PATH):
+    with open(settings_path, 'r') as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        settings_dict = {}
+        for row in reader:
+            settings_dict[row[0]] = float(row[1])
+    return settings_dict
+
+def construct_model(peak_dict, settings_dict):
+    peak_names = list(peak_dict.keys())
+    peak_type = settings_dict['PEAK_TYPE']
+    if peak_type == 0:
+        from lmfit.models import GaussianModel as PeakModel
+    elif peak_type == 1:
+        from lmfit.models import LorentzianModel as PeakModel
+    elif peak_type == 2:
+        from lmfit.models import VoigtModel as PeakModel
+    else:
+        raise ValueError("Invalid peak type")
+    model = PeakModel(prefix=peak_names[0]+'_')
+    for peak_name in peak_names[1:]:
+        model += PeakModel(prefix=peak_name+'_')
+
+    background_type = settings_dict['BACKGROUND']
+    if background_type == 0:
+        pass
+    elif background_type == 1:
+        model += models.ConstantModel(prefix='constbg_')
+    elif background_type == 2:
+        model += models.LinearModel(prefix='linbg_')
+    elif background_type == 3:
+        model += models.LinearModel(prefix='linbg1_') + models.LinearModel(prefix='linbg2_')
+    else:
+        raise ValueError("Invalid background type")
+    
+    params = model.make_params()
+    for peak_name in peak_names:
+        params[peak_name+'_amplitude'].set(min=0)
+        params[peak_name+'_center'].set((peak_dict[peak_name][0] + peak_dict[peak_name][1])/2, min=peak_dict[peak_name][0], max=peak_dict[peak_name][1])
+        params[peak_name+'_sigma'].set(min=settings_dict['SIGMA_LB'], max=settings_dict['SIGMA_UB'])
+    
+    return model, params
+
+def save_abstract_result(result, filename, peak_dict, abstract_result_path=ABSTRACT_RESULT_PATH):
+    # make ABSTRACT_RESULT_PATH directory if not exists
+    if not os.path.exists(os.path.dirname(abstract_result_path)):
+        os.makedirs(os.path.dirname(abstract_result_path))
+    
+    peak_names = list(peak_dict.keys())
+
+    # Write header if not exists
+    header_exists = False
+    if os.path.exists(abstract_result_path):
+        with open(abstract_result_path, 'r', newline='') as f:
+            first_line = f.readline()
+            if first_line:
+                header_exists = True
+    if not header_exists:
+        header = ['filename']
+        for peak_name in peak_names:
+            header.append(peak_name+'(%)')
+        with open(abstract_result_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+    
+    # Write peak amplitude ratio to the file
+    peak_amplitudes = [result.best_values[peak_name + '_amplitude'] for peak_name in peak_names]
+    total_amplitude = sum(peak_amplitudes)
+    ratio = [peak_amplitudes[i] / total_amplitude * 100 for i in range(len(peak_amplitudes))]
+    with open(abstract_result_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([filename] + ratio)
+
+def save_fitted_function(result, filename, peak_dict, fitted_function_path=FITTED_FUNCTION_PATH):
+    # Write header if not exists
+    header_exists = False
+    if os.path.exists(fitted_function_path):
+        with open(fitted_function_path, 'r', newline='') as f:
+            first_line = f.readline()
+            if first_line:
+                header_exists = True
+    if not header_exists:
+        bvk = list(result.best_values.keys())
+        bvk.append('rsquared')
+        header = ['filename'] + bvk
+        with open(fitted_function_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+    
+    # Write fitted function to the file
+    with open(fitted_function_path, 'r') as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        header_keys = header[1:]
+    fitted_function = [result.best_values[bk] for bk in header_keys[:-1]]
+    with open(fitted_function_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([filename] + fitted_function + [result.rsquared])
+
+def save_curve_image(x, y, result, filename, peak_dict, settings_dict, curve_image_path=CURVE_IMAGE_PATH, FNC_DOTS=200):
+    # make CURVE_IMAGE_PATH directory if not exists
+    if not os.path.exists(curve_image_path):
+        os.makedirs(curve_image_path, exist_ok=True)
+    
+    fig, (ax_res, ax_main) = plt.subplots(
+        2, 1,
+        figsize=(10, 10),
+        sharex=True,
+        gridspec_kw={'height_ratios': [1, 3]}
+    )
+    # Plot residuals
+    residuals = result.residual
+    ax_res.scatter(x, residuals)
+    ax_res.axhline(0, linestyle='--')
+    ax_res.set_ylabel('residuals')
+
+    # Plot main figure
+    ax_main.scatter(x, y, label='measured data')
+    
+    x_fit = np.linspace(settings_dict['RANGE_MIN'], settings_dict['RANGE_MAX'], FNC_DOTS)
+    y_fit = result.model.eval(params=result.params, x=x_fit)
+    fit_label = f"fit (R²={result.rsquared:.4f})"
+    ax_main.plot(x_fit, y_fit, '-', label=fit_label, color='#a0a0a0')
+
+    peak_names = list(peak_dict.keys())
+    peak_amplitudes = [result.best_values[peak_name + '_amplitude'] for peak_name in peak_names]
+    total_amplitude = sum(peak_amplitudes)
+    peak_ratios = {}
+    if total_amplitude != 0:
+        for name, amp in zip(peak_names, peak_amplitudes):
+            peak_ratios[name] = amp / total_amplitude * 100
+
+    # component curves (peak + background)
+    y_fit_components = result.model.eval_components(params=result.params, x=x_fit)
+    for i in range(len(y_fit_components)):
+        prefixname = result.model.components[i].prefix
+        comp_name = prefixname[:-1]
+        if comp_name in peak_ratios:
+            label = f"{comp_name} ({peak_ratios[comp_name]:.1f}%)"
+            # peak center vertical line
+            center = result.best_values[comp_name + '_center']
+            ax_main.axvline(center, color='gray', linestyle='--', alpha=0.6)
+        else:
+            label = comp_name
+        ax_main.plot(x_fit, y_fit_components[prefixname], '-', label=label)
+
+    ax_main.set_xlabel('x')
+    ax_main.set_ylabel('y')
+    mae = np.mean(np.abs(residuals))
+    ax_res.set_title(f'Residuals (MAE={mae:.4g})')
+    ax_main.set_title('Spectrum and fit')
+    fig.suptitle(filename, fontsize=18, fontweight='bold', y=0.975)
+
+    ax_main.legend()
+    plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+    fig.savefig(os.path.join(curve_image_path, filename + '.png'), bbox_inches='tight', dpi=300)
+
+if __name__ == "__main__":
+    file_names = os.listdir(DATA_PATH)
+
+    peak_dict = get_peak_dict()
+    settings_dict = get_settings_dict()
+
+    with tqdm(file_names, desc="Processing files") as pbar:
+        for filename in pbar:
+            file_path = os.path.join(DATA_PATH, filename)
+            if not os.path.isfile(file_path):
+                continue
+            pbar.set_postfix_str(filename)
+
+            spectrum = np.loadtxt(file_path, delimiter=',')
+            x_all = spectrum[:, 0]; y_all = spectrum[:, 1]
+            mask =  (x_all >= settings_dict['RANGE_MIN']) & (x_all <= settings_dict['RANGE_MAX'])
+            x = x_all[mask]; y = y_all[mask]
+
+            model, params = construct_model(peak_dict, settings_dict)
+
+            result = model.fit(y, params, x=x)
+
+            save_abstract_result(result, filename, peak_dict)
+            save_fitted_function(result, filename, peak_dict)
+            save_curve_image(x, y, result, filename, peak_dict, settings_dict)

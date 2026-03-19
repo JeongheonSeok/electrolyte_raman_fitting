@@ -1,3 +1,16 @@
+"""
+기존 피팅 프로그램에서 어떻게 하는지 참고해보기
+중요한 피크 먼저 피팅하고 그 다음 덜 중요한 피크 피팅하게 할 수도 있는지?
+
+피크 모양을 잘 담을 수 있게끔 하는 다른 최적화 metric이 있는지?
+
+1. 너비 기준 제어 가능한지?
+
+2. fitting시 metric으로 다른걸 사용할 수 있는지?
+
+3. 모든 single curve들에 대해 하나의 S로 고정해서 grid search를 먼저 한 다음 이것들을 init point로 다시 하는 것도 가능할지?
+"""
+
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # non-interactive backend; must be set before pyplot import
@@ -76,17 +89,44 @@ def construct_model(peak_dict, settings_dict):
     return model, params
 
 
-def initialize_params_from_data(params, peak_dict, x, y):
+def initialize_params_from_data(params, peak_dict, x, y, settings_dict=None):
     # Initialize amplitude from actual y values near each peak range
     y_baseline = float(np.percentile(y, 10))
+    y_max = float(np.max(y))
+
+    # Physically meaningful amplitude upper bound:
+    # amplitude = height * sigma * scale_factor, so max_amp = y_max * SIGMA_UB * scale_factor
+    # Gaussian: scale = sqrt(2π) ≈ 2.507 / Lorentzian: scale = π ≈ 3.14 / Voigt: ~between
+    # We use π as a conservative upper bound that covers all three peak types.
+    if settings_dict is not None:
+        sigma_ub = settings_dict.get('SIGMA_UB', 50.0)
+        peak_type = settings_dict.get('PEAK_TYPE', 0)
+        scale = np.sqrt(2 * np.pi) if peak_type == 0 else np.pi
+        amp_max = y_max * sigma_ub * scale
+    else:
+        amp_max = y_max * 50.0
+
     for peak_name, (lo, hi) in peak_dict.items():
         mask = (x >= lo) & (x <= hi)
         if mask.any():
             amp_init = float(np.max(y[mask]) - y_baseline)
         else:
-            amp_init = float(np.max(y) - y_baseline)
+            amp_init = float(y_max - y_baseline)
         amp_init = max(amp_init, 1e-6)
-        params[peak_name + '_amplitude'].set(amp_init)
+        params[peak_name + '_amplitude'].set(value=amp_init, min=0, max=amp_max)
+
+    # Set finite bounds for background parameters
+    y_min = float(np.min(y))
+    y_range = float(y_max - y_min)
+    x_span = float(x[-1] - x[0]) if len(x) > 1 else 1.0
+    for pname in params:
+        if pname.endswith('_c') or pname.endswith('_intercept'):
+            # Constant background must not exceed the smallest measured value
+            params[pname].set(value=y_min, min=y_min - y_range, max=y_min)
+        elif pname.endswith('_slope'):
+            slope_bound = y_range / max(x_span, 1e-10) * 2
+            params[pname].set(value=0.0, min=-slope_bound, max=slope_bound)
+
     return params
 
 
@@ -220,7 +260,7 @@ def process_file(args):
     x = x_all[mask]; y = y_all[mask]
 
     model, params = construct_model(peak_dict, settings_dict)
-    params = initialize_params_from_data(params, peak_dict, x, y)
+    params = initialize_params_from_data(params, peak_dict, x, y, settings_dict)
     result = fit_robust(model, params, x, y, settings_dict)
 
     save_curve_image(x, y, result, filename, peak_dict, settings_dict, curve_image_path)

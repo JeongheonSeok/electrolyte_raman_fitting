@@ -4,52 +4,26 @@
 
 피크 모양을 잘 담을 수 있게끔 하는 다른 최적화 metric이 있는지?
 
-2. fitting시 metric으로 다른걸 사용할 수 있는지?
+1. 너비 기준 제어 가능한지?
 """
 
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # non-interactive backend; must be set before pyplot import
 import matplotlib.pyplot as plt
-from lmfit import Model, models, minimize as lmfit_minimize
+from lmfit import Model, models
 from tqdm import tqdm
 import os
 import csv
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from scipy.ndimage import gaussian_filter1d
-
-# ── 비용함수 설정 ────────────────────────────────────────────────────────────
-# 세 가지 전략을 동시에 사용한다. False 로 바꾸면 기본 최소제곱(SSR)으로 복귀.
-ENABLE_CUSTOM_COST = True
-
-# 전략 1: 피크 기울기 구간 가중치 배율
-#   값이 클수록 경사면(≈ 피크 어깨) 부근의 잔차를 더 강하게 반영.
-#   봉우리 두 개를 하나로 뭉개는 문제에 효과적.
-_GRAD_WEIGHT = 3.0
-
-# 전략 2: 이차미분 일치 항의 상대 영향력
-#   1.0이면 기본 잔차 항과 동등한 영향. 곡률까지 맞추므로 피크 형태 보존에 강함.
-_D2_FRACTION = 0.5
-
-# 전략 3: sigma 정규화 강도
-#   sigma가 허용 범위 상단(SIGMA_UB)에 달했을 때 잔차 몇 σ 에 상당하는 페널티를 줄지.
-#   피크 하나가 지나치게 넓어져 다른 피크를 먹는 문제에 직접 대응.
-_SIGMA_PENALTY = 2.0
-
-# 전략 4: sigma 균일성 강도
-#   각 피크의 sigma 가 전체 피크 sigma 평균에서 얼마나 벗어나도 될지 제어.
-#   값이 클수록 모든 피크가 거의 동일한 폭을 갖도록 강제.
-#   피크가 1개뿐이면 자동으로 무시됨.
-_SIGMA_SIMILARITY = 3
-# ─────────────────────────────────────────────────────────────────────────────
 
 DATA_PATH = "./spectra"
 ABSTRACT_RESULT_PATH = "./results/abstract_results.csv"
 FITTED_FUNCTION_PATH = "./results/fitted_functions.csv"
 CURVE_IMAGE_PATH = "./results/curve_images"
 PEAK_LOC_PATH = "./peak_location.csv"
-SETTINGS_PATH = "./settings.csv"
+SETTINGS_PATH = "./settings_better-ing.csv"
 
 def get_peak_dict(peak_loc_path=PEAK_LOC_PATH):
     with open(peak_loc_path, 'r') as f:
@@ -141,105 +115,15 @@ def initialize_params_from_data(params, peak_dict, x, y, settings_dict=None):
     y_min = float(np.min(y))
     y_range = float(y_max - y_min)
     x_span = float(x[-1] - x[0]) if len(x) > 1 else 1.0
-    x_lo = float(x[0])
-    # 선형 배경 기울기 최대 허용치: x 범위 전체에서 y_range 의 20% 이내 변화
-    slope_bound = y_range / max(x_span, 1e-10) * 0.2
     for pname in params:
-        if pname.endswith('_c'):
-            # 상한: 데이터 최솟값 — 배경이 스펙트럼 바닥을 초과하면 피크 amplitude 가 왜곡됨
-            # 하한: 최솟값에서 y_range 의 10% 아래까지 허용 (양수/음수 모두 가능, 노이즈 여유)
-            # min != max 보장을 위해 범위가 0 인 경우 최소 1.0 확보
-            bg_ub = float(y_min)
-            bg_lb = y_min - max(y_range * 0.1, 1.0)
-            params[pname].set(value=(bg_lb + bg_ub) / 2, min=bg_lb, max=bg_ub)
-        elif pname.endswith('_intercept'):
-            # LinearModel: 절편은 x=0 기준이므로 x 가 700대이면 음수도 정상.
-            # bg(x_lo) = slope*x_lo + intercept 가 [0, y_min] 안에 들도록 범위 설정.
-            params[pname].set(
-                value=max(0.0, y_min * 0.5),
-                min=-slope_bound * x_lo,
-                max=y_min + slope_bound * x_lo,
-            )
+        if pname.endswith('_c') or pname.endswith('_intercept'):
+            # Constant background must not exceed the smallest measured value
+            params[pname].set(value=y_min, min=y_min - y_range, max=y_min)
         elif pname.endswith('_slope'):
+            slope_bound = y_range / max(x_span, 1e-10) * 2
             params[pname].set(value=0.0, min=-slope_bound, max=slope_bound)
 
     return params
-
-
-class FitResultWrapper:
-    """lmfit.minimize() 결과를 Model.fit() 결과(ModelResult)와 동일한 인터페이스로 감싼다.
-
-    save_curve_image / process_file 등 하위 코드에서 result.model, result.rsquared,
-    result.best_values, result.residual 등을 그대로 참조할 수 있도록 한다.
-    """
-    def __init__(self, minimize_result, model, x, y):
-        self.params = minimize_result.params
-        self.best_values = minimize_result.params.valuesdict()
-        self.model = model
-        y_calc = model.eval(params=minimize_result.params, x=x)
-        self.residual = y - y_calc
-        ss_res = float(np.sum(self.residual ** 2))
-        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-        self.rsquared = 1.0 - ss_res / ss_tot if ss_tot > 1e-30 else 0.0
-
-
-def make_combined_residual(model, x, y, peak_dict, settings_dict):
-    """네 가지 전략을 동시에 적용하는 결합 잔차 함수를 반환한다.
-
-    전략 1 (기울기 가중): 피크 경사면 근방의 잔차에 추가 가중치 → 봉우리 두 개를 하나로 뭉개는 현상 억제
-    전략 2 (이차미분 일치): 잔차 배열 뒤에 곡률 잔차를 이어붙임 → 피크 모양 자체를 충실히 재현
-    전략 3 (sigma 정규화): sigma가 허용 범위 중간값을 초과하면 페널티 → 과도하게 넓은 피크 억제
-    전략 4 (sigma 균일성): 각 피크 sigma의 평균 이탈량에 페널티 → 모든 피크가 비슷한 폭을 갖도록 유도
-
-    모든 항은 데이터 스케일로 자동 정규화된다. 파일 상단 상수로 강도 조절.
-    """
-    sigma_lb = float(settings_dict.get('SIGMA_LB', 5.0))
-    sigma_ub = float(settings_dict.get('SIGMA_UB', 50.0))
-    sigma_mid = (sigma_lb + sigma_ub) / 2.0
-    sigma_half_range = (sigma_ub - sigma_lb) / 2.0 + 1e-10
-    peak_names = list(peak_dict.keys())
-
-    # 데이터 기반 사전 계산 (params 비의존 → 한 번만 수행)
-    y_std = float(np.std(y)) + 1e-10
-
-    grad_y = np.abs(np.gradient(y, x))
-    grad_norm = grad_y / (grad_y.max() + 1e-10)
-
-    y_smooth = gaussian_filter1d(y.astype(float), sigma=2)
-    d2_data = np.gradient(np.gradient(y_smooth, x), x)
-    d2_std = float(np.std(d2_data)) + 1e-10
-
-    def residual_fn(params):
-        y_calc = model.eval(params=params, x=x)
-        base = y - y_calc
-
-        # 전략 1: 기울기 가중 잔차 (y_std 로 정규화)
-        weights = 1.0 + _GRAD_WEIGHT * grad_norm
-        part1 = base * weights / y_std
-
-        # 전략 2: 이차미분 일치 (d2_std 로 정규화, _D2_FRACTION 으로 영향력 조절)
-        y_calc_s = gaussian_filter1d(y_calc.astype(float), sigma=2)
-        d2_calc = np.gradient(np.gradient(y_calc_s, x), x)
-        part2 = _D2_FRACTION * (d2_data - d2_calc) / d2_std
-
-        # 전략 3: sigma 정규화 (sigma_half_range 로 정규화, _SIGMA_PENALTY 로 강도 조절)
-        part3 = np.array([
-            _SIGMA_PENALTY * max(0.0, (params[p + '_sigma'].value - sigma_mid) / sigma_half_range)
-            for p in peak_names
-        ])
-
-        # 전략 4: sigma 균일성 — 각 피크의 sigma 가 전체 평균에서 벗어난 양에 페널티
-        # 피크가 1개이면 평균 이탈이 항상 0이므로 자동으로 무시됨
-        sigmas = np.array([params[p + '_sigma'].value for p in peak_names])
-        sigma_mean = float(np.mean(sigmas))
-        part4 = np.array([
-            _SIGMA_SIMILARITY * abs(s - sigma_mean) / sigma_half_range
-            for s in sigmas
-        ])
-
-        return np.concatenate([part1, part2, part3, part4])
-
-    return residual_fn
 
 
 def _run_single_trial(args):
@@ -248,82 +132,17 @@ def _run_single_trial(args):
     return model.fit(y, trial_params, x=x, method='leastsq')
 
 
-def fit_robust(model, params, x, y, settings_dict, peak_dict=None):
-    """피팅을 수행한다.
-
-    COST_FUNCTION == 0 (기본값) 이면 model.fit()을 사용하는 기존 경로를 그대로 밟는다.
-    COST_FUNCTION != 0 이면 make_custom_residual()로 만든 잔차 함수와
-    lmfit.minimize()를 사용하고, 결과를 FitResultWrapper로 감싸 반환한다.
-
-    peak_dict 가 None 이면 커스텀 비용함수를 쓸 수 없으므로 기본 경로로 대체된다.
-    """
+def fit_robust(model, params, x, y, settings_dict):
+    # Stage 1: global search via Differential Evolution
+    # Stage 2: refine with Levenberg-Marquardt starting from DE result
+    # Optional: parallel multi-start (add USE_MULTISTART and N_STARTS to settings.csv)
     use_multistart = int(settings_dict.get('USE_MULTISTART', 0)) == 1
     n_starts = int(settings_dict.get('N_STARTS', 20))
-    use_custom_cost = ENABLE_CUSTOM_COST and (peak_dict is not None)
 
-    def _make_trial_params(base_params, rng):
-        tp = base_params.copy()
-        for name, par in tp.items():
-            if par.vary and par.min is not None and par.max is not None:
-                if not name.endswith('_amplitude'):
-                    tp[name].set(float(rng.uniform(par.min, par.max)))
-        return tp
-
-    def _rsq_from_params(fitted_params):
-        y_calc = model.eval(params=fitted_params, x=x)
-        ss_res = float(np.sum((y - y_calc) ** 2))
-        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-        return 1.0 - ss_res / ss_tot if ss_tot > 1e-30 else 0.0
-
-    # ── 커스텀 비용함수 경로 ────────────────────────────────────────────────
-    if use_custom_cost:
-        residual_fn = make_combined_residual(model, x, y, peak_dict, settings_dict)
-
-        def _run_custom_trial(trial_params):
-            return lmfit_minimize(residual_fn, trial_params, method='leastsq')
-
-        best_raw = None
-        best_rsq = -np.inf
-
-        # Stage 1: Differential Evolution 전역 탐색 → LM 정밀화
-        try:
-            res_de = lmfit_minimize(residual_fn, params, method='differential_evolution')
-            res_ref = lmfit_minimize(residual_fn, res_de.params, method='leastsq')
-            rsq = _rsq_from_params(res_ref.params)
-            if rsq > best_rsq:
-                best_rsq = rsq
-                best_raw = res_ref
-        except Exception:
-            pass
-
-        # Stage 2: 병렬 멀티스타트 (선택)
-        if use_multistart:
-            rng = np.random.default_rng(42)
-            trial_params_list = [_make_trial_params(params, rng) for _ in range(n_starts)]
-            n_workers = min(n_starts, multiprocessing.cpu_count())
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = [pool.submit(_run_custom_trial, tp) for tp in trial_params_list]
-                for fut in as_completed(futures):
-                    try:
-                        res = fut.result()
-                        rsq = _rsq_from_params(res.params)
-                        if rsq > best_rsq:
-                            best_rsq = rsq
-                            best_raw = res
-                    except Exception:
-                        continue
-
-        # Fallback
-        if best_raw is None:
-            best_raw = lmfit_minimize(residual_fn, params, method='leastsq')
-
-        return FitResultWrapper(best_raw, model, x, y)
-
-    # ── 기본 최소제곱 경로 (COST_FUNCTION == 0) ────────────────────────────
     best_result = None
     best_rsq = -np.inf
 
-    # Stage 1: Differential Evolution → LM
+    # Strategy A: Differential Evolution for global search
     try:
         res_de = model.fit(y, params, x=x, method='differential_evolution')
         res_refined = model.fit(y, res_de.params, x=x, method='leastsq')
@@ -333,14 +152,22 @@ def fit_robust(model, params, x, y, settings_dict, peak_dict=None):
     except Exception:
         pass
 
-    # Stage 2: 병렬 멀티스타트 (선택)
-    # scipy/numpy가 GIL을 해제하므로 ThreadPoolExecutor로 진정한 병렬성 확보
+    # Strategy B: parallel multi-start, randomizing only center and sigma (optional)
+    # Amplitude is kept from data-based initialization since it is reliably estimated,
+    # while center and sigma are the uncertain parameters when peaks overlap.
+    # scipy/numpy release the GIL during computation, so ThreadPoolExecutor gives
+    # true parallelism here without the pickling overhead of ProcessPoolExecutor.
     if use_multistart:
         rng = np.random.default_rng(42)
-        trial_args = [
-            (model, _make_trial_params(params, rng), x, y)
-            for _ in range(n_starts)
-        ]
+        trial_args = []
+        for _ in range(n_starts):
+            tp = params.copy()
+            for name, par in tp.items():
+                if par.vary and par.min is not None and par.max is not None:
+                    if not name.endswith('_amplitude'):
+                        tp[name].set(float(rng.uniform(par.min, par.max)))
+            trial_args.append((model, tp, x, y))
+
         n_workers = min(n_starts, multiprocessing.cpu_count())
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = [pool.submit(_run_single_trial, args) for args in trial_args]
@@ -353,7 +180,7 @@ def fit_robust(model, params, x, y, settings_dict, peak_dict=None):
                 except Exception:
                     continue
 
-    # Fallback
+    # Fallback: plain local optimization
     if best_result is None:
         best_result = model.fit(y, params, x=x)
 
@@ -430,7 +257,7 @@ def process_file(args):
 
     model, params = construct_model(peak_dict, settings_dict)
     params = initialize_params_from_data(params, peak_dict, x, y, settings_dict)
-    result = fit_robust(model, params, x, y, settings_dict, peak_dict=peak_dict)
+    result = fit_robust(model, params, x, y, settings_dict)
 
     save_curve_image(x, y, result, filename, peak_dict, settings_dict, curve_image_path)
 
